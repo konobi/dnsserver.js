@@ -21,10 +21,23 @@
 
 var sys = require('sys'),
     Buffer = require('buffer').Buffer,
-    dgram = require('dgram');
+    dgram = require('dgram'),
+    ctype = require('./node-ctype');
 
 host = 'localhost';
 port = 9999;
+
+var server = dgram.createSocket('udp4');
+    
+server.on('message', function (msg, rinfo) {
+    //split up the message into the dns request header info and the query
+    var q = processRequest(msg);
+
+    buf = createResponse(q);
+    server.send(buf, 0, buf.length, rinfo.port, rinfo.address, function (err, sent) {
+        
+    });
+});
 
 // slices a single byte into bits
 // assuming only single bytes
@@ -35,103 +48,46 @@ var sliceBits = function(b, off, len) {
     return b & ~(0xff << len);
 };
 
-var server = dgram.createSocket('udp4');
-    
-server.on('message', function (msg, rinfo) {
-    
-    //split up the message into the dns request header info and the query
-    var q = processRequest(msg);
-
-    buf = createResponse(q);
-    server.send(buf, 0, buf.length, rinfo.port, rinfo.address, function (err, sent) {
-        
-    });
-});
-
 //takes a buffer as a request
 var processRequest = function(req) {
     //see rfc1035 for more details
     //http://tools.ietf.org/html/rfc1035#section-4.1.1
-    
+
     var query = {};
     query.header = {};
     //TODO write code to break questions up into an array
     query.question = {};
 
-    var tmpSlice;
-    var tmpByte;
-        
-    //transaction id
-    // 2 bytes
-    query.header.id = req.slice(0,2);
-
-    //slice out a byte for the next section to dice into binary.
-    tmpSlice = req.slice(2,3);
-    //convert the binary buf into a string and then pull the char code
-    //for the byte
-    tmpByte = tmpSlice.toString('binary', 0, 1).charCodeAt(0);
+    var dns_parser = new ctype.Parser({ endian: 'big' }); 
     
-    //qr
-    // 1 bit
-    query.header.qr = sliceBits(tmpByte, 0,1);
-    //opcode
-    // 0 = standard, 1 = inverse, 2 = server status, 3-15 reserved
-    // 4 bits
-    query.header.opcode = sliceBits(tmpByte, 1,4);
-    //authorative answer
-    // 1 bit
-    query.header.aa = sliceBits(tmpByte, 5,1);
-    //truncated
-    // 1 bit
-    query.header.tc = sliceBits(tmpByte, 6,1);
-    //recursion desired
-    // 1 bit
-    query.header.rd = sliceBits(tmpByte, 7,1);
+    query.header = dns_parser.readData([
+        { id: { type: 'int16_t' } },
+        { header_fields1: { type: 'char' } },
+        { header_fields2: { type: 'char' } },
+        { qdcount: { type: 'uint16_t' } },
+        { ancount: { type: 'uint16_t' } },
+        { nscount: { type: 'uint16_t' } },
+        { arcount: { type: 'uint16_t' } },
+    ], req, 0);
 
-    //slice out a byte to dice into binary
-    tmpSlice = req.slice(3,4);
-    //convert the binary buf into a string and then pull the char code
-    //for the byte
-    tmpByte = tmpSlice.toString('binary', 0, 1).charCodeAt(0);
+    var tmpByte = query.header.header_fields1.toString('binary', 0, 1).charCodeAt(0);
+    query.header.qr = sliceBits(tmpByte, 0, 1);
+    query.header.opcode = sliceBits(tmpByte, 1, 4);
+    query.header.aa = sliceBits(tmpByte, 5, 1);
+    query.header.tc = sliceBits(tmpByte, 6, 1);
+    query.header.rd = sliceBits(tmpByte, 7, 1);
     
-    //recursion available
-    // 1 bit
-    query.header.ra = sliceBits(tmpByte, 0,1);
+    tmpByte = query.header.header_fields2.toString('binary', 0, 1).charCodeAt(0);
+    query.header.ra = sliceBits(tmpByte, 0, 1);
+    query.header.z = sliceBits(tmpByte, 1, 3);
+    query.header.rcode = sliceBits(tmpByte, 4, 4);
 
-    //reserved 3 bits
-    // rfc says always 0
-    query.header.z = sliceBits(tmpByte, 1,3);
+    query.question = dns_parser.readData([
+        { qname: { type: 'char[' + (req.length - 16) + ']' } },
+        { qtype: { type: 'char[2]' } },
+        { qclass: { type: 'char[2]' } },
+    ], req, 12);
 
-    //response code
-    // 0 = no error, 1 = format error, 2 = server failure
-    // 3 = name error, 4 = not implemented, 5 = refused
-    // 6-15 reserved
-    // 4 bits
-    query.header.rcode = sliceBits(tmpByte, 4,4);
-
-    //question count
-    // 2 bytes
-    query.header.qdcount = req.slice(4,6);
-    //answer count
-    // 2 bytes
-    query.header.ancount = req.slice(6,8);
-    //ns count
-    // 2 bytes
-    query.header.nscount = req.slice(8,10);
-    //addition resources count
-    // 2 bytes
-    query.header.arcount = req.slice(10, 12);
-    
-    //assuming one question
-    //qname is the sequence of domain labels
-    //qname length is not fixed however it is 4
-    //octets from the end of the buffer
-    query.question.qname = req.slice(12, req.length - 4);
-    //qtype
-    query.question.qtype = req.slice(req.length - 4, req.length - 2);
-    //qclass
-    query.question.qclass = req.slice(req.length - 2, req.length);
-    
     return query;
 };
 
@@ -224,52 +180,63 @@ var buildResponseBuffer = function(response) {
     var qnameLen = response.question.qname.length;
     var len = 16 + qnameLen;
     var buf = getZeroBuf(len);
-    
-    response.header.id.copy(buf, 0, 0, 2);
-    
-    buf[2] = 0x00 | response.header.qr << 7 | response.header.opcode << 3 | response.header.aa << 2 | response.header.tc << 1 | response.header.rd;
-    
 
-    buf[3] = 0x00 | response.header.ra << 7 | response.header.z << 4 | response.header.rcode;
+    var dns_writer = new ctype.Parser({ endian: 'big' });
 
-    numToBuffer(buf, 4, response.header.qdcount, 2);
+    var header_fields_1_buf = new Buffer(1);
+    var header_fields_2_buf = new Buffer(1);
+    header_fields_1_buf[0] = (0x00 | response.header.qr << 7 | response.header.opcode << 3 | response.header.aa << 2 | response.header.tc << 1 | response.header.rd);
+    header_fields_2_buf[0] = (0x00 | response.header.ra << 7 | response.header.z << 4 | response.header.rcode);
 
-    numToBuffer(buf, 6, response.header.ancount, 2);
-    numToBuffer(buf, 8, response.header.nscount, 2);
-    numToBuffer(buf, 10, response.header.arcount, 2);
+    var layout = [
+        { id: { type: 'int16_t', value: response.header.id } },
+        { header_fields1: { type: 'char[1]', value: header_fields_1_buf } },
+        { header_fields2: { type: 'char[1]', value: header_fields_2_buf } },
+        { qdcount: { type: 'uint16_t', value: response.header.qdcount } },
+        { ancount: { type: 'uint16_t', value: response.header.ancount } },
+        { nscount: { type: 'uint16_t', value: response.header.nscount } },
+        { arcount: { type: 'uint16_t', value: response.header.arcount } }
+    ];
+    dns_writer.writeData(layout, buf, 0);
 
-    //end header
+    console.log(buf); 
 
-    response.question.qname.copy(buf, 12, 0, qnameLen);
-    response.question.qtype.copy(buf, 12+qnameLen, response.question.qtype, 2);
-    response.question.qclass.copy(buf, 12+qnameLen+2, response.question.qclass, 2);
+    dns_writer.writeData([
+        { qname: { type: 'char[' + response.question.qname.length + ']', value: response.question.qname } },
+        { qtype: { type: 'char[2]', value: response.question.qtype } },
+        { qclass: { type: 'char[2]', value: response.question.qclass } },
+    ], buf, 12);
+
+    console.log(buf); 
 
     var rrStart = 12+qnameLen+4;
-    
     for (var i=0;i<response.rr.length;i++) {
         //TODO figure out if this is actually cheaper than just iterating 
         //over the rr section up front and counting before creating buf
         //
         //create a new buffer to hold the request plus the rr
         //len of each response is 14 bytes of stuff + qname len 
-        var tmpBuf = getZeroBuf(buf.length + response.rr[i].qname.length + 14);
-                
+        var rr = response.rr[i];
+        var tmpBuf = getZeroBuf(buf.length + rr.qname.length + 14);
+
         buf.copy(tmpBuf, 0, 0, buf.length);
 
-        response.rr[i].qname.copy(tmpBuf, rrStart, 0, response.rr[i].qname.length);
-        numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length, response.rr[i].qtype, 2);
-        numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+2, response.rr[i].qclass, 2);
+        dns_writer.writeData([
+            { qname: { type: 'char['+rr.qname.length+']', value: rr.qname } },
+            { qtype: { type: 'char[2]', value: rr.qtype } },
+            { qclass: { type: 'char[2]', value: rr.qclass } },
+            { ttl:  { type: 'uint32_t', value: rr.ttl } },
+            { rdlength: { type: 'uint16_t', value: rr.rdlength } },
+            { rdata: { type: 'char[rdlength]', value: rr.rdata } }
+        ], tmpBuf, rrStart);
 
-        numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+4, response.rr[i].ttl, 4);
-        numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+8, response.rr[i].rdlength, 2);
-        numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+10, response.rr[i].rdata, response.rr[i].rdlength); // rdlength indicates rdata length
-        
         rrStart = rrStart + response.rr[i].qname.length + 14;
         
         buf = tmpBuf;
     }
-    
+ 
     //TODO compression
+    console.log(buf); 
    
     return buf;
 };
@@ -305,69 +272,37 @@ var findRecords = function(qname, qtype, qclass) {
     } else {
         throw new Error('Only internet class records supported');
     }
-    
-    switch(qtype) {
-        case 1:
-            qtype = 'a'; //a host address
-            break;
-        case 2:
-            qtype = 'ns'; //an authoritative name server
-            break;
-        case 3:
-            qtype = 'md'; //a mail destination (Obsolete - use MX)
-            break;
-        case 4:
-            qtype = 'mf'; //a mail forwarder (Obsolete - use MX)
-            break;
-        case 5:
-            qtype = 'cname'; //the canonical name for an alias
-            break;
-        case 6:
-            qtype = 'soa'; //marks the start of a zone of authority
-            break;
-        case 7:
-            qtype = 'mb'; //a mailbox domain name (EXPERIMENTAL)
-            break;
-        case 8:
-            qtype = 'mg'; //a mail group member (EXPERIMENTAL)
-            break;
-        case 9:
-            qtype = 'mr'; //a mail rename domain name (EXPERIMENTAL)
-            break;
-        case 10:
-            qtype = 'null'; //a null RR (EXPERIMENTAL)
-            break;
-        case 11:
-            qtype = 'wks'; //a well known service description
-            break;
-        case 12:
-            qtype = 'ptr'; //a domain name pointer
-            break;
-        case 13:
-            qtype = 'hinfo'; //host information
-            break;
-        case 14:
-            qtype = 'minfo'; //mailbox or mail list information
-            break;
-        case 15:
-            qtype = 'mx'; //mail exchange
-            break;
-        case 16:
-            qtype = 'txt'; //text strings
-            break;
-        case 255:
-            qtype = '*'; //select all types
-            break;
-        default:
-            throw new Error('No valid type specified');
-            break;
+
+    var types = {
+         1:   'a', //a host address
+         2:   'ns', //an authoritative name server
+         3:   'md', //a mail destination (Obsolete - use MX)
+         4:   'mf', //a mail forwarder (Obsolete - use MX)
+         5:   'cname', //the canonical name for an alias
+         6:   'soa', //marks the start of a zone of authority
+         7:   'mb', //a mailbox domain name (EXPERIMENTAL)
+         8:   'mg', //a mail group member (EXPERIMENTAL)
+         9:   'mr', //a mail rename domain name (EXPERIMENTAL)
+         10:  'null', //a null RR (EXPERIMENTAL)
+         11:  'wks', //a well known service description
+         12:  'ptr', //a domain name pointer
+         13:  'hinfo', //host information
+         14:  'minfo', //mailbox or mail list information
+         15:  'mx', //mail exchange
+         16:  'txt', //text strings
+         255: '*' //select all types
+     };
+
+    qtype = types[qtype];
+    if(qtype === undefined){
+        throw new Error('No valid type specified');
     }
 
     var domain = qnameToDomain(qname);        
     
     //TODO add support for wildcard
     if (qtype === '*') {
-        throw new Error('Wildcard not support');
+        throw new Error('Wildcard not supported');
     } else {
         var rr = records[domain][qclass][qtype];
     }
@@ -378,7 +313,7 @@ var findRecords = function(qname, qtype, qclass) {
 };
 
 var qnameToDomain = function(qname) {
-    
+
     var domain= '';
     for(var i=0;i<qname.length;i++) {
         if (qname[i] == 0) {
@@ -401,6 +336,13 @@ server.addListener('error', function (e) {
   throw e;
 });
 
+function hextobin(hexstr) {
+   buf = new Buffer(hexstr.length / 2);
+   for(var i = 0; i < hexstr.length/2 ; i++) {
+      buf[i] = (parseInt(hexstr[i * 2], 16) << 4) + (parseInt(hexstr[i * 2 + 1], 16));
+   }
+   return buf;
+ }
 
 //
 //TODO create records database
@@ -412,21 +354,21 @@ records['tomhughescroucher.com']['in']['a'] = [];
 
 var r = {};
 r.qname = domainToQname('tomhughescroucher.com');
-r.qtype = 1;
-r.qclass = 1;
-r.ttl = 1;
+r.qtype = hextobin('0001');
+r.qclass = hextobin('0001');
+r.ttl = 360;
 r.rdlength = 4;
-r.rdata = 0xBC8A0009;
+r.rdata = hextobin('BC8A0009');
 
 records['tomhughescroucher.com']['in']['a'].push(r);
 
 r = {};
 r.qname = domainToQname('tomhughescroucher.com');
-r.qtype = 1;
-r.qclass = 1;
-r.ttl = 1;
+r.qtype = hextobin('0001');
+r.qclass = hextobin('0001');
+r.ttl = 360;
 r.rdlength = 4;
-r.rdata = 0x7F000001;
+r.rdata = hextobin('7F000001');
 
 records['tomhughescroucher.com']['in']['a'].push(r);
 
